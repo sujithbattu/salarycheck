@@ -1,14 +1,11 @@
 import { NextResponse } from 'next/server';
 
 type FinnhubQuote = {
-  c: number; // current price
-  d: number; // change
-  dp: number; // percent change
-  h: number;
-  l: number;
-  o: number;
-  pc: number; // previous close
-  t: number; // timestamp
+  c: number;  // Current price
+  d: number;  // Change
+  dp: number; // Percent change
+  pc: number; // Previous close
+  t: number;  // Timestamp
 };
 
 type FinnhubNewsItem = {
@@ -16,7 +13,6 @@ type FinnhubNewsItem = {
   summary: string;
   source: string;
   url: string;
-  image?: string;
   datetime: number;
 };
 
@@ -25,13 +21,7 @@ function toIso(tsSeconds?: number) {
   return new Date(tsSeconds * 1000).toISOString();
 }
 
-function classifySignal({
-  spyChangePct,
-  spyVsPrevClose,
-}: {
-  spyChangePct: number;
-  spyVsPrevClose: number;
-}) {
+function classifySignal(spy: FinnhubQuote, vix: FinnhubQuote) {
   let score = 50;
   let trend: 'BULLISH' | 'NEUTRAL' | 'BEARISH' = 'NEUTRAL';
   let momentum: 'STRONG' | 'MIXED' | 'WEAK' = 'MIXED';
@@ -39,148 +29,101 @@ function classifySignal({
   let breadth: 'STRONG' | 'MIXED' | 'WEAK' = 'MIXED';
   const reasons: string[] = [];
 
-  if (spyVsPrevClose > 0) {
+  // 1. Trend Logic (Price vs Prev Close)
+  const spyDiff = spy.c - spy.pc;
+  if (spyDiff > 0) {
     trend = 'BULLISH';
-    score += 18;
-    reasons.push('SPY is trading above the previous close, which supports a bullish trend bias.');
-  } else if (spyVsPrevClose < 0) {
+    score += 15;
+    reasons.push('SPY is trading above yesterday’s close.');
+  } else {
     trend = 'BEARISH';
-    score -= 18;
-    reasons.push('SPY is trading below the previous close, which weakens the trend picture.');
-  } else {
-    reasons.push('SPY is near the previous close, which suggests a neutral trend read.');
+    score -= 15;
+    reasons.push('SPY is trading below yesterday’s close.');
   }
 
-  if (spyChangePct >= 1.0) {
+  // 2. Momentum Logic (Day Change %)
+  if (spy.dp >= 0.8) {
     momentum = 'STRONG';
-    score += 18;
-    reasons.push('SPY has strong positive daily momentum.');
-  } else if (spyChangePct <= -1.0) {
+    score += 15;
+  } else if (spy.dp <= -0.8) {
     momentum = 'WEAK';
-    score -= 18;
-    reasons.push('SPY has weak negative daily momentum.');
-  } else {
-    reasons.push('SPY momentum is present but not decisive.');
+    score -= 15;
   }
 
-  // Temporary placeholder until VIX is wired.
-  if (spyChangePct > 0.75) {
+  // 3. Volatility Logic (Using actual VIX)
+  if (vix.c < 18) {
     volatility = 'CALM';
-    score += 8;
-    reasons.push('Price action is favoring offense more than defense right now.');
-  } else if (spyChangePct < -0.75) {
+    score += 15;
+    reasons.push(`VIX is low (${vix.c.toFixed(2)}), favoring risk-on entries.`);
+  } else if (vix.c > 25) {
     volatility = 'HIGH';
-    score -= 8;
-    reasons.push('Recent price action suggests a more defensive volatility environment.');
+    score -= 20;
+    reasons.push(`VIX is elevated (${vix.c.toFixed(2)}). Avoid high leverage.`);
   } else {
-    reasons.push('Volatility conditions look mixed, not ideal for max aggression.');
+    volatility = 'ELEVATED';
+    reasons.push('VIX is in the "choppy" zone (18-25).');
   }
 
-  if (trend === 'BULLISH' && momentum === 'STRONG') {
-    breadth = 'STRONG';
-    score += 6;
-    reasons.push('Trend and momentum are aligned, which usually improves signal quality.');
-  } else if (trend === 'BEARISH' && momentum === 'WEAK') {
-    breadth = 'WEAK';
-    score -= 6;
-    reasons.push('Trend and momentum are aligned to the downside, so caution is warranted.');
-  } else {
-    reasons.push('Market participation looks mixed.');
-  }
-
+  // 4. Score Normalization
   score = Math.max(0, Math.min(100, score));
 
   let status: 'AGGRESSIVE' | 'BUILD' | 'DEFENSIVE' = 'BUILD';
-  let action =
-    'Keep investing normally, but do not rush into aggressive MES exposure yet.';
+  if (score >= 70) status = 'AGGRESSIVE';
+  if (score <= 40) status = 'DEFENSIVE';
 
-  if (score >= 70) {
-    status = 'AGGRESSIVE';
-    action =
-      'Conditions are favorable enough to consider offensive risk. If you trade MES, keep sizing controlled and follow stop rules.';
-  } else if (score <= 40) {
-    status = 'DEFENSIVE';
-    action =
-      'Avoid aggressive MES entries. Keep building cash and let the market improve first.';
-  }
+  const action = status === 'AGGRESSIVE' 
+    ? 'Conditions favor offense. Consider 1 MES contract with tight stops.' 
+    : status === 'BUILD' 
+    ? 'Neutral environment. Focus on long-term shares, avoid futures.' 
+    : 'High risk environment. Preserve capital and stay in cash.';
 
   return { status, score, trend, momentum, volatility, breadth, reasons, action };
 }
 
 export async function GET() {
   const apiKey = process.env.FINNHUB_API_KEY;
-
-  if (!apiKey) {
-    return NextResponse.json(
-      { error: 'Missing FINNHUB_API_KEY' },
-      { status: 500 }
-    );
-  }
+  if (!apiKey) return NextResponse.json({ error: 'Missing API Key' }, { status: 500 });
 
   try {
-    const quoteRes = await fetch(
-      `https://finnhub.io/api/v1/quote?symbol=SPY&token=${apiKey}`,
-      { cache: 'no-store' }
-    );
+    // Parallel fetching for speed
+    const [spyRes, vixRes, newsRes] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/quote?symbol=SPY&token=${apiKey}`, { cache: 'no-store' }),
+      fetch(`https://finnhub.io/api/v1/quote?symbol=VIX&token=${apiKey}`, { cache: 'no-store' }),
+      fetch(`https://finnhub.io/api/v1/news?category=general&token=${apiKey}`, { cache: 'no-store' })
+    ]);
 
-    const newsRes = await fetch(
-      `https://finnhub.io/api/v1/news?category=general&token=${apiKey}`,
-      { cache: 'no-store' }
-    );
+    const spy = await spyRes.json() as FinnhubQuote;
+    const vix = await vixRes.json() as FinnhubQuote;
+    const news = await newsRes.json() as FinnhubNewsItem[];
 
-    if (!quoteRes.ok || !newsRes.ok) {
-      throw new Error('Failed to fetch Finnhub data');
-    }
-
-    const quote = (await quoteRes.json()) as FinnhubQuote;
-    const news = (await newsRes.json()) as FinnhubNewsItem[];
-
-    const signal = classifySignal({
-      spyChangePct: quote.dp ?? 0,
-      spyVsPrevClose: (quote.c ?? 0) - (quote.pc ?? 0),
-    });
-
-    const trimmedNews = (news || []).slice(0, 6).map((item) => ({
-      headline: item.headline,
-      summary: item.summary,
-      source: item.source,
-      url: item.url,
-      datetime: item.datetime,
-    }));
+    const signal = classifySignal(spy, vix);
 
     return NextResponse.json({
       ...signal,
       spy: {
         symbol: 'SPY',
-        price: quote.c ?? 0,
-        change: quote.d ?? 0,
-        changePercent: quote.dp ?? 0,
-        updatedAt: toIso(quote.t),
+        price: spy.c,
+        change: spy.d,
+        changePercent: spy.dp,
+        updatedAt: toIso(spy.t),
       },
-      // Placeholder until Polygon is added.
-      mes: {
-        symbol: 'MES',
-        price: 0,
-        change: 0,
-        changePercent: 0,
-        updatedAt: toIso(),
-      },
-      // Placeholder until Polygon indices/VIX is added.
       vix: {
         symbol: 'VIX',
-        price: 0,
-        change: 0,
-        changePercent: 0,
+        price: vix.c,
+        change: vix.d,
+        changePercent: vix.dp,
+        updatedAt: toIso(vix.t),
+      },
+      mes: { // Placeholder for MES as it usually requires a paid Polygon/Tradier key
+        symbol: 'MES (EST)',
+        price: spy.c * 10, 
+        change: spy.d * 10,
+        changePercent: spy.dp,
         updatedAt: toIso(),
       },
-      news: trimmedNews,
+      news: (news || []).slice(0, 5),
     });
-  } catch (error) {
-    return NextResponse.json(
-      {
-        error: error instanceof Error ? error.message : 'Unknown error',
-      },
-      { status: 500 }
-    );
+  } catch (err) {
+    return NextResponse.json({ error: 'Data fetch failed' }, { status: 500 });
   }
 }
